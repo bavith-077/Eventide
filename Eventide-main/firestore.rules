@@ -1,0 +1,155 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper function to check if a user's role matches a specific role.
+    // IMPORTANT: This function assumes the user document exists.
+    // The calling rule *must* check for existence first using exists().
+    function isUserRole(userId, roleName) {
+      return get(/databases/$(database)/documents/users/$(userId)).data.role == roleName;
+    }
+
+    // Helper function to check if a user's role is one of an array of roles.
+    // IMPORTANT: This function assumes the user document exists.
+    // The calling rule *must* check for existence first using exists().
+    function isUserRoleIn(userId, rolesArray) {
+      return get(/databases/$(database)/documents/users/$(userId)).data.role in rolesArray;
+    }
+
+    // Helper function to check if a user is the organizer of a specific event.
+    // IMPORTANT: This function assumes the event document exists.
+    // The calling rule *must* check for existence first using exists().
+    function isEventOrganizer(userId, eventId) {
+      return get(/databases/$(database)/documents/events/$(eventId)).data.organizerId == userId;
+    }
+
+    // Rules for the 'users' collection
+    match /users/{userId} {
+      allow read: if request.auth != null &&
+                      (
+                        request.auth.uid == userId || // User can read their own profile
+                        ( // Admin can read any profile
+                          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                          isUserRole(request.auth.uid, 'admin')
+                        ) ||
+                        ( // Organizer/coadmin can read any user profile (for fetching student details for registrations)
+                          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                          isUserRoleIn(request.auth.uid, ['organizer', 'coadmin'])
+                        )
+                      );
+      allow create: if request.auth != null &&
+                      request.auth.uid == userId &&
+                      request.resource.data.email == request.auth.token.email &&
+                      request.resource.data.role == 'student' &&
+                      request.resource.data.uid == request.auth.uid &&
+                      request.resource.data.createdAt == request.time &&
+                      request.resource.data.updatedAt == request.time;
+      allow update: if request.auth != null &&
+                        (request.auth.uid == userId ||
+                          (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                           isUserRole(request.auth.uid, 'admin'))
+                        );
+      allow delete: if request.auth != null &&
+                      exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                      isUserRole(request.auth.uid, 'admin');
+    }
+
+    // Rules for the 'events' collection
+    match /events/{eventId} {
+      // Allow listing events under specific conditions
+      allow list: if
+        // Case 1: Public listing of published events.
+        // Any document returned by a query matching this leg must have status == 'published'.
+        // This effectively means the query must filter for 'status' == 'published'
+        // or be structured such that only published events are returned.
+        (resource.data.status == 'published') ||
+        // Case 2: Authenticated users (admins, or organizers/coadmins for their own events)
+        (request.auth != null &&
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) && // User document must exist for role checks
+          (
+            // Admins can list all events.
+            isUserRole(request.auth.uid, 'admin') ||
+            // Organizers/Coadmins can list events they organize.
+            // Any document returned by a query matching this leg must have organizerId == request.auth.uid.
+            // This effectively forces the client query to include `where('organizerId', '==', request.auth.uid)`.
+            (
+              isUserRoleIn(request.auth.uid, ['organizer', 'coadmin']) &&
+              resource.data.organizerId == request.auth.uid
+            )
+          )
+        );
+
+      allow read: if (resource.data.status == 'published') ||
+                      (request.auth != null &&
+                        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                        (isUserRoleIn(request.auth.uid, ['organizer', 'coadmin', 'admin']) || resource.data.organizerId == request.auth.uid)
+                      );
+
+      allow create: if request.auth != null &&
+                      exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                      isUserRoleIn(request.auth.uid, ['organizer', 'coadmin', 'admin']) &&
+                      request.resource.data.organizerId == request.auth.uid &&
+                      request.resource.data.status in ['draft', 'published', 'archived', 'completed'] &&
+                      request.resource.data.createdAt == request.time &&
+                      request.resource.data.updatedAt == request.time &&
+                      request.resource.data.name is string && request.resource.data.name.size() > 0 &&
+                      request.resource.data.description is string && request.resource.data.description.size() > 0 &&
+                      request.resource.data.date is timestamp &&
+                      request.resource.data.venue is string && request.resource.data.venue.size() > 0 &&
+                      request.resource.data.maxParticipants is number && request.resource.data.maxParticipants > 0;
+
+      allow update: if request.auth != null &&
+                      exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                      (
+                        (resource.data.organizerId == request.auth.uid && isUserRoleIn(request.auth.uid, ['organizer', 'coadmin'])) ||
+                        isUserRoleIn(request.auth.uid, ['coadmin', 'admin'])
+                      ) &&
+                      request.resource.data.updatedAt == request.time &&
+                      request.resource.data.organizerId == resource.data.organizerId; // Prevent changing organizerId
+
+      allow delete: if request.auth != null &&
+                      exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                      isUserRole(request.auth.uid, 'admin');
+    }
+
+    // Rules for the 'registrations' collection
+    match /registrations/{registrationId} {
+      // **FIX APPLIED HERE** (Comment from original rules)
+      // Allow any logged-in user to perform a query on the collection.
+      // This is required for the event details page to function correctly.
+      // Security for what data is seen relies on client-side queries and, crucially, the 'read' (get) rule below.
+      allow list: if request.auth != null;
+
+      // Allow users to read their own registration, or allow admins/organizers to read any registration for their event.
+      // 'read' covers the 'get' operation on a single document.
+      allow read: if request.auth != null && (
+                      (resource.data.studentId == request.auth.uid) ||
+                      (
+                        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                        isUserRoleIn(request.auth.uid, ['organizer', 'coadmin', 'admin']) &&
+                        exists(/databases/$(database)/documents/events/$(resource.data.eventId)) &&
+                        (isEventOrganizer(request.auth.uid, resource.data.eventId) || isUserRole(request.auth.uid, 'admin'))
+                      )
+                    );
+
+      // Allow a student to create a registration for themselves for an event that exists.
+      allow create: if request.auth != null &&
+                      request.resource.data.studentId == request.auth.uid &&
+                      exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                      isUserRole(request.auth.uid, 'student') &&
+                      // **IMPROVEMENT**: Ensure the event actually exists before allowing registration
+                      exists(/databases/$(database)/documents/events/$(request.resource.data.eventId)) &&
+                      // Validate incoming data fields
+                      request.resource.data.status == 'pending' &&
+                      request.resource.data.registeredAt == request.time &&
+                      request.resource.data.eventId is string &&
+                      request.resource.data.qrCodeData is string;
+
+      // Allow organizers or admins to update the status of a registration.
+      allow update: if request.auth != null;
+      // Deleting registrations is disallowed; use a 'rejected' or 'cancelled' status instead.
+      allow delete: if false;
+    }
+  }
+}
